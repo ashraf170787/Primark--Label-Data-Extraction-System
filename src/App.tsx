@@ -19,7 +19,12 @@ import {
   ArrowRight,
   ChevronRight,
   Info,
-  Layout
+  Layout,
+  Settings,
+  Plus,
+  Edit2,
+  Trash2,
+  Save
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -31,16 +36,44 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-type Tab = 'extract' | 'merge';
+type Tab = 'extract' | 'merge' | 'master';
+
+interface Region {
+  id: string;
+  name: string;
+}
+
+const DEFAULT_REGIONS: Region[] = [
+  { id: '1', name: 'ROI' },
+  { id: '2', name: 'GCC' },
+  { id: '3', name: 'ROO' },
+  { id: '4', name: 'NE1 - MGB' },
+  { id: '5', name: 'NE2 - BOR' },
+  { id: '6', name: 'IB' },
+  { id: '7', name: 'UK' },
+  { id: '8', name: 'UK Trial' },
+  { id: '9', name: 'US1 - PA' },
+  { id: '10', name: 'US2 - FL' },
+];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('extract');
   const [isUploading, setIsUploading] = useState(false);
+  const [retryCountdown, setRetryCountdown] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   
+  // Region Master State
+  const [regions, setRegions] = useState<Region[]>(() => {
+    const saved = localStorage.getItem('pdf_master_regions');
+    return saved ? JSON.parse(saved) : DEFAULT_REGIONS;
+  });
+  const [editingRegion, setEditingRegion] = useState<Region | null>(null);
+  const [newRegionName, setNewRegionName] = useState('');
+
   // Extract State
   const [extractFile, setExtractFile] = useState<File | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<string>('');
   const [extractedData, setExtractedData] = useState<any>(null);
   const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set());
   const [previewTableKey, setPreviewTableKey] = useState<string | null>(null);
@@ -59,6 +92,7 @@ export default function App() {
       const file = files[0];
       if (file && file.type === 'application/pdf') {
         setExtractFile(file);
+        setSelectedRegion('');
         setError(null);
       } else {
         setError('Please select a valid PDF file.');
@@ -91,6 +125,10 @@ export default function App() {
 
   const handleExtract = async () => {
     if (!extractFile) return;
+    if (!selectedRegion) {
+      setError('Please select a region first.');
+      return;
+    }
     
     setIsAnalyzing(true);
     setError(null);
@@ -109,17 +147,16 @@ export default function App() {
       const pdfBase64 = await fileToBase64(extractFile);
 
       const prompt = `
-        You are a highly accurate data extraction tool. Your goal is to identify and extract EVERY distinct table from the provided PDF.
+        You are a highly accurate data extraction tool. Your goal is to identify and extract the table for the region "${selectedRegion}" from the provided PDF.
         
         CRITICAL INSTRUCTIONS:
-        1. Scan the entire document for tables. Do NOT stop after the first one.
-        2. Return a JSON object where EACH distinct regional section is a separate key. You MUST identify and separate these 10 specific regions: "ROI", "GCC", "ROO", "NE1 - MGB", "NE2 - BOR", "IB", "UK", "UK Trial", "US1 - PA", and "US2 - FL".
-        3. For each table, provide a FLAT array of objects representing the data rows. Do NOT include "Total" rows or summary rows; only extract the individual item/size rows.
-        4. Add a "Region" column as the FIRST column in every row. The value MUST match the region name (e.g., "ROI", "GCC", etc.).
+        1. Scan the entire document for the table belonging to region "${selectedRegion}".
+        2. Return a JSON object where the key is "${selectedRegion}".
+        3. Provide a FLAT array of objects representing the data rows for this region. Do NOT include "Total" rows or summary rows; only extract the individual item/size rows.
+        4. Add a "Region" column as the FIRST column in every row. The value MUST be "${selectedRegion}".
         5. Capture all headers accurately (SKU, Barcode, Kimball, Colour, Size, Price, etc.).
-        6. If a table is split across pages or interrupted by text (like "Page 2" or "Total"), but has the same headers or belongs to the same section (like "NE2 - BOR"), you MUST merge all rows into a single array under that table's name.
-        7. If tables have different headers, they MUST be separate keys in the JSON.
-        8. Do NOT skip any data rows. Every row visible in the PDF must be captured.
+        6. If the table for "${selectedRegion}" is split across pages or interrupted by text (like "Page 2" or "Total"), you MUST merge all rows into a single array.
+        7. Do NOT skip any data rows for this region. Every row visible in the PDF for "${selectedRegion}" must be captured.
         
         Return ONLY the raw JSON object. No markdown formatting.
       `;
@@ -216,12 +253,35 @@ export default function App() {
       setSuccess(`Found ${Object.keys(normalized).length} tables. Select which ones to extract.`);
     } catch (err: any) {
       console.error('Analysis error:', err);
-      let message = err.message || 'An error occurred during analysis.';
       
-      if (message.includes('429') || message.includes('RESOURCE_EXHAUSTED')) {
-        message = 'The AI service is currently busy or you have reached the usage limit. Please wait a minute and try again.';
-      } else if (message.includes('API key')) {
-        message = 'The AI service is not properly configured. Please check the API settings.';
+      let message = 'An error occurred during analysis.';
+      const errString = JSON.stringify(err);
+      const errMessage = err.message || '';
+      const fullErrorText = (errMessage + ' ' + errString + ' ' + String(err)).toLowerCase();
+      
+      const isQuotaError = 
+        fullErrorText.includes('429') || 
+        fullErrorText.includes('quota') ||
+        fullErrorText.includes('limit') ||
+        fullErrorText.includes('resource_exhausted') ||
+        fullErrorText.includes('exhausted');
+
+      if (isQuotaError) {
+        message = 'The AI service has reached its usage limit. Please wait 60 seconds for the quota to reset. If this persists, ensure your personal Gemini API key is configured in the Settings.';
+        setRetryCountdown(60);
+        const timer = setInterval(() => {
+          setRetryCountdown(prev => {
+            if (prev <= 1) {
+              clearInterval(timer);
+              return 0;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+      } else if (fullErrorText.includes('api key') || fullErrorText.includes('key not found') || fullErrorText.includes('unauthorized')) {
+        message = 'The AI service is not properly configured. Please ensure your Gemini API key is correctly set in the App Settings.';
+      } else {
+        message = errMessage || 'An unexpected error occurred. Please try again.';
       }
       
       setError(message);
@@ -313,6 +373,37 @@ export default function App() {
     }
   };
 
+  const saveRegions = (newRegions: Region[]) => {
+    setRegions(newRegions);
+    localStorage.setItem('pdf_master_regions', JSON.stringify(newRegions));
+  };
+
+  const addRegion = () => {
+    if (!newRegionName.trim()) return;
+    const newRegion: Region = {
+      id: Date.now().toString(),
+      name: newRegionName.trim(),
+    };
+    saveRegions([...regions, newRegion]);
+    setNewRegionName('');
+  };
+
+  const deleteRegion = (id: string) => {
+    saveRegions(regions.filter(r => r.id !== id));
+  };
+
+  const startEditing = (region: Region) => {
+    setEditingRegion(region);
+    setNewRegionName(region.name);
+  };
+
+  const saveEdit = () => {
+    if (!editingRegion || !newRegionName.trim()) return;
+    saveRegions(regions.map(r => r.id === editingRegion.id ? { ...r, name: newRegionName.trim() } : r));
+    setEditingRegion(null);
+    setNewRegionName('');
+  };
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
@@ -345,6 +436,15 @@ export default function App() {
                 )}
               >
                 Merge PDFs
+              </button>
+              <button
+                onClick={() => setActiveTab('master')}
+                className={cn(
+                  "px-4 py-1.5 rounded-md text-sm font-medium transition-all",
+                  activeTab === 'master' ? "bg-white text-primary-600 shadow-sm" : "text-slate-600 hover:text-slate-900"
+                )}
+              >
+                Region Master
               </button>
             </nav>
           </div>
@@ -474,10 +574,88 @@ export default function App() {
                   >
                     Merge
                   </button>
+                  <button
+                    onClick={() => setActiveTab('master')}
+                    className={cn(
+                      "flex-1 py-2 rounded-lg text-sm font-medium transition-all",
+                      activeTab === 'master' ? "bg-white text-primary-600 shadow-sm" : "text-slate-600"
+                    )}
+                  >
+                    Master
+                  </button>
                 </div>
 
-                {/* Dropzone (Only shown if no data or in merge tab) */}
-                {(!extractedData || activeTab === 'merge') && (
+                {activeTab === 'master' ? (
+                  <div className="space-y-8">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-12 h-12 bg-primary-50 rounded-2xl flex items-center justify-center text-primary-600">
+                          <Settings size={24} />
+                        </div>
+                        <div>
+                          <h3 className="text-xl font-bold text-slate-900">Region Master</h3>
+                          <p className="text-sm text-slate-500 font-medium">Manage your extraction regions</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-3">
+                      <input
+                        type="text"
+                        value={newRegionName}
+                        onChange={(e) => setNewRegionName(e.target.value)}
+                        placeholder="Enter region name (e.g. ROI, UK)"
+                        className="flex-1 px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-all font-medium"
+                      />
+                      {editingRegion ? (
+                        <button
+                          onClick={saveEdit}
+                          className="px-6 py-3 bg-primary-600 text-white rounded-xl font-bold hover:bg-primary-700 transition-all flex items-center gap-2"
+                        >
+                          <Save size={20} /> Save
+                        </button>
+                      ) : (
+                        <button
+                          onClick={addRegion}
+                          className="px-6 py-3 bg-primary-600 text-white rounded-xl font-bold hover:bg-primary-700 transition-all flex items-center gap-2"
+                        >
+                          <Plus size={20} /> Add
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      {regions.length > 0 ? (
+                        regions.map((region) => (
+                          <div key={region.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100 hover:border-primary-100 transition-all group">
+                            <span className="font-bold text-slate-700">{region.name}</span>
+                            <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-all">
+                              <button
+                                onClick={() => startEditing(region)}
+                                className="p-2 text-slate-400 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-all"
+                              >
+                                <Edit2 size={16} />
+                              </button>
+                              <button
+                                onClick={() => deleteRegion(region.id)}
+                                className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="col-span-full py-12 text-center bg-slate-50 rounded-3xl border border-dashed border-slate-200">
+                          <p className="text-slate-400 font-medium">No regions defined. Add one above to get started.</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Dropzone (Only shown if no data or in merge tab) */}
+                    {(!extractedData || activeTab === 'merge') && (
                   <div 
                     onClick={() => fileInputRef.current?.click()}
                     className={cn(
@@ -577,23 +755,39 @@ export default function App() {
                       initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: -10 }}
-                      className="mt-6 p-4 bg-slate-50 rounded-xl flex items-center justify-between border border-slate-100"
+                      className="mt-6 space-y-6"
                     >
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center text-primary-600 shadow-sm">
-                          <FileText size={20} />
+                      <div className="p-4 bg-slate-50 rounded-xl flex items-center justify-between border border-slate-100">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center text-primary-600 shadow-sm">
+                            <FileText size={20} />
+                          </div>
+                          <div className="overflow-hidden">
+                            <p className="text-sm font-bold text-slate-900 truncate max-w-[200px]">{extractFile.name}</p>
+                            <p className="text-xs text-slate-500">{(extractFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                          </div>
                         </div>
-                        <div className="overflow-hidden">
-                          <p className="text-sm font-bold text-slate-900 truncate max-w-[200px]">{extractFile.name}</p>
-                          <p className="text-xs text-slate-500">{(extractFile.size / 1024 / 1024).toFixed(2)} MB</p>
-                        </div>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); setExtractFile(null); }}
+                          className="p-2 hover:bg-slate-200 rounded-full text-slate-400 transition-colors"
+                        >
+                          <X size={18} />
+                        </button>
                       </div>
-                      <button 
-                        onClick={(e) => { e.stopPropagation(); setExtractFile(null); }}
-                        className="p-2 hover:bg-slate-200 rounded-full text-slate-400 transition-colors"
-                      >
-                        <X size={18} />
-                      </button>
+
+                      <div className="space-y-3">
+                        <label className="text-sm font-bold text-slate-700 block ml-1">Select Region to Extract</label>
+                        <select
+                          value={selectedRegion}
+                          onChange={(e) => setSelectedRegion(e.target.value)}
+                          className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 outline-none transition-all font-medium bg-white"
+                        >
+                          <option value="">-- Choose a Region --</option>
+                          {regions.map(r => (
+                            <option key={r.id} value={r.name}>{r.name}</option>
+                          ))}
+                        </select>
+                      </div>
                     </motion.div>
                   )}
 
@@ -630,10 +824,23 @@ export default function App() {
                     <motion.div 
                       initial={{ opacity: 0, height: 0 }}
                       animate={{ opacity: 1, height: 'auto' }}
-                      className="mt-6 p-4 bg-red-50 text-red-700 rounded-xl flex items-start gap-3 border border-red-100"
+                      className="mt-6 p-4 bg-red-50 text-red-700 rounded-xl flex flex-col gap-3 border border-red-100"
                     >
-                      <AlertCircle size={20} className="shrink-0 mt-0.5" />
-                      <p className="text-sm font-medium">{error}</p>
+                      <div className="flex items-start gap-3">
+                        <AlertCircle size={20} className="shrink-0 mt-0.5" />
+                        <div className="space-y-1">
+                          <p className="text-sm font-bold">Analysis Failed</p>
+                          <p className="text-xs leading-relaxed opacity-90">{error}</p>
+                        </div>
+                      </div>
+                      {retryCountdown === 0 && !isAnalyzing && (
+                        <button 
+                          onClick={activeTab === 'extract' ? handleExtract : handleMerge}
+                          className="text-xs font-bold bg-white/50 hover:bg-white px-3 py-1.5 rounded-lg border border-red-200 transition-all self-start"
+                        >
+                          Try Again
+                        </button>
+                      )}
                     </motion.div>
                   )}
                   {success && !extractedData && (
@@ -652,11 +859,11 @@ export default function App() {
                 {!extractedData && (
                   <div className="mt-8">
                     <button
-                      disabled={isAnalyzing || isUploading || (activeTab === 'extract' ? !extractFile : mergeFiles.length < 2)}
+                      disabled={isAnalyzing || isUploading || retryCountdown > 0 || (activeTab === 'extract' ? !extractFile : mergeFiles.length < 2)}
                       onClick={activeTab === 'extract' ? handleExtract : handleMerge}
                       className={cn(
                         "w-full py-4 rounded-2xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg",
-                        (isAnalyzing || isUploading)
+                        (isAnalyzing || isUploading || retryCountdown > 0)
                           ? "bg-slate-100 text-slate-400 cursor-not-allowed" 
                           : "bg-primary-600 text-white hover:bg-primary-700 hover:shadow-primary-200 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none disabled:cursor-not-allowed"
                       )}
@@ -665,6 +872,11 @@ export default function App() {
                         <>
                           <Loader2 size={20} className="animate-spin" />
                           {isAnalyzing ? "Analyzing PDF..." : "Processing..."}
+                        </>
+                      ) : retryCountdown > 0 ? (
+                        <>
+                          <Loader2 size={20} className="animate-spin" />
+                          Retry in {retryCountdown}s...
                         </>
                       ) : (
                         <>
@@ -678,7 +890,9 @@ export default function App() {
                     </button>
                   </div>
                 )}
-              </div>
+              </>
+            )}
+          </div>
               
               {/* Footer Info */}
               <div className="bg-slate-50 px-8 py-4 border-t border-slate-100 flex items-center justify-between">
